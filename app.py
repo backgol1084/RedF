@@ -14,6 +14,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+
 # ---------------------------------------------------------------------------
 # 1. Supabase 클라이언트 초기화
 # ---------------------------------------------------------------------------
@@ -31,11 +32,10 @@ supabase = init_supabase()
 # 2. 모바일 / PC 판별 및 페이지 전환 상태 관리
 # ---------------------------------------------------------------------------
 def detect_is_mobile() -> bool:
-    """쿼리 파라미터 또는 브라우저 요청 헤더(User-Agent)로 모바일 여부를 판별합니다."""
     qp_device = st.query_params.get("device", "").lower()
     if qp_device == "mobile":
         return True
-    if qp_device == "desktop" or qp_device == "pc":
+    if qp_device in ("desktop", "pc"):
         return False
 
     ua = ""
@@ -62,14 +62,81 @@ def detect_is_mobile() -> bool:
 is_mobile = detect_is_mobile()
 
 if "page" not in st.session_state:
-    # 모바일은 첫 페이지(인수/반품/조회 메뉴), PC는 바로 조회 페이지
     st.session_state.page = "home" if is_mobile else "lookup"
 
 if "pending_delete_id" not in st.session_state:
     st.session_state.pending_delete_id = None
 
-if "last_scanned_code" not in st.session_state:
-    st.session_state.last_scanned_code = ""
+if "last_scan_nonce" not in st.session_state:
+    st.session_state.last_scan_nonce = ""
+
+if "play_ding" not in st.session_state:
+    st.session_state.play_ding = False
+
+if "ding_nonce" not in st.session_state:
+    st.session_state.ding_nonce = 0
+
+
+def trigger_ding() -> None:
+    st.session_state.play_ding = True
+    st.session_state.ding_nonce += 1
+
+
+def render_ding_if_needed() -> None:
+    """저장 및 리스트 반영 직후 '띵~' 사운드를 1회 재생합니다."""
+    if not st.session_state.get("play_ding"):
+        return
+
+    nonce = st.session_state.get("ding_nonce", 0)
+    st.session_state.play_ding = False
+
+    ding_html = f"""
+    <div id="ding-marker-{nonce}" style="display:none;"></div>
+    <script>
+      (function() {{
+        try {{
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          if (!AudioCtx) return;
+          const ctx = new AudioCtx();
+          const now = ctx.currentTime;
+
+          // '띵~' 느낌의 맑은 벨 톤 (A5 -> D6)
+          const osc1 = ctx.createOscillator();
+          const osc2 = ctx.createOscillator();
+          const gain = ctx.createGain();
+
+          osc1.type = "sine";
+          osc2.type = "triangle";
+
+          osc1.frequency.setValueAtTime(880, now);
+          osc1.frequency.exponentialRampToValueAtTime(1174.66, now + 0.08);
+
+          osc2.frequency.setValueAtTime(1760, now);
+          osc2.frequency.exponentialRampToValueAtTime(2349.32, now + 0.08);
+
+          gain.gain.setValueAtTime(0.001, now);
+          gain.gain.linearRampToValueAtTime(0.28, now + 0.015);
+          gain.gain.exponentialRampToValueAtTime(0.0008, now + 0.55);
+
+          osc1.connect(gain);
+          osc2.connect(gain);
+          gain.connect(ctx.destination);
+
+          osc1.start(now);
+          osc2.start(now);
+          osc1.stop(now + 0.58);
+          osc2.stop(now + 0.58);
+
+          osc1.onended = () => {{
+            ctx.close().catch(() => {{}});
+          }};
+        }} catch (e) {{
+          // 오디오 재생 제한 환경 무시
+        }}
+      }})();
+    </script>
+    """
+    html(ding_html, height=0)
 
 
 def go_to(target_page: str) -> None:
@@ -97,10 +164,9 @@ def apply_theme(page_name: str) -> None:
                 background-color: {bg_color} !important;
             }}
             .block-container {{
-                padding-top: 1.5rem;
+                padding-top: 1.4rem;
                 padding-bottom: 3rem;
             }}
-            /* 홈 화면 메인 버튼 스타일 */
             .redf-btn-inbound button {{
                 background-color: #2563EB !important;
                 color: #FFFFFF !important;
@@ -138,10 +204,10 @@ def apply_theme(page_name: str) -> None:
                 background-color: #EAB308 !important;
             }}
             .item-card {{
-                background-color: rgba(255, 255, 255, 0.88);
+                background-color: rgba(255, 255, 255, 0.92);
                 border: 1px solid #E5E7EB;
                 border-radius: 12px;
-                padding: 0.9rem 1rem;
+                padding: 0.85rem 1rem;
                 margin-bottom: 0.65rem;
             }}
         </style>
@@ -154,57 +220,88 @@ apply_theme(st.session_state.page)
 
 
 # ---------------------------------------------------------------------------
-# 4. 상품택 파싱 및 Supabase CRUD 함수
+# 4. 택 텍스트 파싱 (품명, 품번, 색상, 치수) 및 Supabase CRUD
 # ---------------------------------------------------------------------------
-def parse_tag_payload(raw_text: str) -> dict[str, Any]:
-    """
-    상품택(QR/바코드/텍스트) 문자열을 품명, 규격, 색상, 수량으로 파싱합니다.
-    지원 형식 예시:
-      1) JSON: {"item_name":"후드집업","spec":"L","color":"블랙","qty":1}
-      2) 파이프/슬래시/콤마 구분: 후드집업|L|블랙|1 또는 후드집업/L/블랙
-      3) 단일 코드/텍스트: TAG-1001 -> 품명=TAG-1001, 규격=기본, 색상=미지정, 수량=1
-    """
+def _clean_label_value(val: str) -> str:
+    return re.sub(r"\s+", " ", val).strip(" :·.-")
+
+
+def parse_redf_tag_text(raw_text: str) -> dict[str, Any]:
     cleaned = raw_text.strip()
     if not cleaned:
         raise ValueError("인식된 택 데이터가 비어 있습니다.")
 
-    # 1) JSON 형식 시도
     if cleaned.startswith("{") and cleaned.endswith("}"):
         data = json.loads(cleaned)
-        qty_val = int(data.get("qty") or data.get("quantity") or data.get("수량") or 1)
         return {
-            "tag_code": str(data.get("tag_code") or data.get("code") or cleaned),
-            "item_name": str(data.get("item_name") or data.get("name") or data.get("품명") or cleaned),
-            "spec": str(data.get("spec") or data.get("size") or data.get("규격") or "기본"),
-            "color": str(data.get("color") or data.get("색상") or "미지정"),
-            "qty": max(1, qty_val),
+            "item_name": _clean_label_value(
+                str(data.get("item_name") or data.get("품명") or "미확인 품명")
+            ),
+            "item_code": _clean_label_value(
+                str(data.get("item_code") or data.get("품번") or "미확인 품번")
+            ),
+            "color": _clean_label_value(
+                str(data.get("color") or data.get("색상") or "미지정")
+            ),
+            "size_val": _clean_label_value(
+                str(data.get("size_val") or data.get("size") or data.get("치수") or "미지정")
+            ),
+            "qty": max(1, int(data.get("qty") or data.get("수량") or 1)),
+            "tag_code": str(data.get("tag_code") or data.get("item_code") or cleaned[:60]),
         }
 
-    # 2) 구분자(|, /, ,) 기반 파싱
-    for sep in ["|", "/", ","]:
-        if sep in cleaned:
-            parts = [p.strip() for p in cleaned.split(sep)]
-            item_name = parts[0] if len(parts) >= 1 and parts[0] else cleaned
-            spec = parts[1] if len(parts) >= 2 and parts[1] else "기본"
-            color = parts[2] if len(parts) >= 3 and parts[2] else "미지정"
-            qty = 1
-            if len(parts) >= 4 and re.fullmatch(r"\d+", parts[3]):
-                qty = max(1, int(parts[3]))
-            return {
-                "tag_code": cleaned,
-                "item_name": item_name,
-                "spec": spec,
-                "color": color,
-                "qty": qty,
-            }
+    item_name = ""
+    item_code = ""
+    color = ""
+    size_val = ""
 
-    # 3) 일반 문자열/바코드
+    name_match = re.search(r"품\s*명\s*[:：\-]?\s*([^\n]+)", cleaned)
+    if name_match:
+        item_name = _clean_label_value(name_match.group(1))
+
+    code_match = re.search(r"품\s*번\s*[:：\-]?\s*([A-Za-z0-9\-_]+)", cleaned)
+    if code_match:
+        item_code = _clean_label_value(code_match.group(1))
+
+    color_match = re.search(r"색\s*상\s*[:：\-]?\s*([^\n]+)", cleaned)
+    if color_match:
+        color = _clean_label_value(color_match.group(1))
+
+    size_match = re.search(
+        r"치\s*수\s*[:：\-]?\s*([0-9]{2,3}(?:\s*[A-Za-z가-힣]+)?)", cleaned
+    )
+    if size_match:
+        size_val = _clean_label_value(size_match.group(1))
+
+    if not (item_name and item_code):
+        for sep in ["|", "/"]:
+            if sep in cleaned:
+                parts = [_clean_label_value(p) for p in cleaned.split(sep)]
+                if len(parts) >= 1 and not item_name:
+                    item_name = parts[0]
+                if len(parts) >= 2 and not item_code:
+                    item_code = parts[1]
+                if len(parts) >= 3 and not color:
+                    color = parts[2]
+                if len(parts) >= 4 and not size_val:
+                    size_val = parts[3]
+                break
+
+    if not item_name and not item_code:
+        raise ValueError("택에서 '품명' 또는 '품번'을 찾지 못했습니다.")
+
+    final_name = item_name or item_code
+    final_code = item_code or "미기재"
+    final_color = color or "미지정"
+    final_size = size_val or "미지정"
+
     return {
-        "tag_code": cleaned,
-        "item_name": cleaned,
-        "spec": "기본",
-        "color": "미지정",
+        "item_name": final_name,
+        "item_code": final_code,
+        "color": final_color,
+        "size_val": final_size,
         "qty": 1,
+        "tag_code": final_code if final_code != "미기재" else final_name[:50],
     }
 
 
@@ -217,15 +314,10 @@ def fetch_records(tx_type: Optional[str] = None) -> list[dict[str, Any]]:
 
 
 def save_scanned_tag(tx_type: str, raw_payload: str) -> tuple[bool, str]:
-    """
-    상품택 인식 시 자동으로 DB에 저장합니다.
-    동일 구분(인수/반품) 내 동일한 (품명, 규격, 색상) 항목이 있으면 수량을 +1 누적하고,
-    없으면 새 행으로 저장합니다.
-    """
     try:
-        parsed = parse_tag_payload(raw_payload)
+        parsed = parse_redf_tag_text(raw_payload)
     except Exception as exc:
-        return False, f"택 데이터 해석 오류: {exc}"
+        return False, f"택 인식 해석 실패: {exc}"
 
     try:
         existing = (
@@ -233,8 +325,9 @@ def save_scanned_tag(tx_type: str, raw_payload: str) -> tuple[bool, str]:
             .select("*")
             .eq("tx_type", tx_type)
             .eq("item_name", parsed["item_name"])
-            .eq("spec", parsed["spec"])
+            .eq("item_code", parsed["item_code"])
             .eq("color", parsed["color"])
+            .eq("size_val", parsed["size_val"])
             .limit(1)
             .execute()
         )
@@ -248,21 +341,29 @@ def save_scanned_tag(tx_type: str, raw_payload: str) -> tuple[bool, str]:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             ).eq("id", row["id"]).execute()
-            return True, f"인식 완료(수량 +{parsed['qty']}): {parsed['item_name']} ({parsed['spec']} / {parsed['color']}) → 총 {new_qty}개"
+            return (
+                True,
+                f"인식·수량추가(+1): {parsed['item_name']} | {parsed['item_code']} | {parsed['color']} | {parsed['size_val']} → {new_qty}개",
+            )
 
         supabase.table("redf_transactions").insert(
             {
-                "tx_type": tx_type,  # 'inbound' | 'return'
+                "tx_type": tx_type,
                 "tag_code": parsed["tag_code"],
                 "item_name": parsed["item_name"],
-                "spec": parsed["spec"],
+                "item_code": parsed["item_code"],
+                "spec": parsed["size_val"],
+                "size_val": parsed["size_val"],
                 "color": parsed["color"],
                 "qty": parsed["qty"],
             }
         ).execute()
-        return True, f"자동 저장 완료: {parsed['item_name']} ({parsed['spec']} / {parsed['color']}) · {parsed['qty']}개"
+        return (
+            True,
+            f"자동 저장 완료: {parsed['item_name']} | {parsed['item_code']} | {parsed['color']} | {parsed['size_val']} (1개)",
+        )
     except Exception as exc:
-        return False, f"DB 저장 중 오류가 발생했습니다: {exc}"
+        return False, f"DB 저장 오류: {exc}"
 
 
 def update_qty(record_id: int, delta: int) -> None:
@@ -288,89 +389,112 @@ def delete_record(record_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. 카메라 상품택 자동 인식 컴포넌트 (셔터 없이 인식 시 자동 전송)
+# 5. 상단 카메라 실시간 택 OCR 자동 인식 (셔터 없이 인식 시 자동 저장)
 # ---------------------------------------------------------------------------
 def render_camera_scanner(tx_type: str) -> None:
-    """
-    상단 카메라 영역:
-    - BarcodeDetector(지원 브라우저) 및 비디오 프레임 스캔으로 택 인식 시
-      촬영 버튼 없이 자동으로 쿼리 파라미터(`scan_payload`, `scan_nonce`)를 갱신해 DB에 저장합니다.
-    - 카메라 권한 불가/미지원 환경 또는 테스트를 위한 즉시 인식 입력창도 함께 제공합니다.
-    """
     st.markdown("#### 📷 상품택 자동 인식 카메라")
-    st.caption("카메라에 상품택을 비추면 촬영 버튼을 누르지 않아도 자동으로 인식되어 저장됩니다.")
+    st.caption("카메라에 택을 비추면 촬영 버튼을 누르지 않아도 품명·품번·색상·치수를 읽어 자동 저장합니다.")
 
     scanner_html = """
     <div style="background:#111827;color:#F9FAFB;padding:12px;border-radius:12px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap;">
-        <span id="cam-status" style="font-size:0.9rem;">카메라 시작 대기 중...</span>
+        <span id="ocr-status" style="font-size:0.88rem;">OCR 엔진 준비 중...</span>
         <div>
-          <button id="btn-start-cam" type="button" style="padding:6px 12px;border-radius:8px;border:none;background:#2563EB;color:#fff;cursor:pointer;font-weight:600;">카메라 켜기</button>
-          <button id="btn-stop-cam" type="button" style="padding:6px 12px;border-radius:8px;border:none;background:#4B5563;color:#fff;cursor:pointer;font-weight:600;">끄기</button>
+          <button id="btn-ocr-start" type="button" style="padding:6px 12px;border-radius:8px;border:none;background:#2563EB;color:#fff;cursor:pointer;font-weight:600;">카메라 켜기</button>
+          <button id="btn-ocr-stop" type="button" style="padding:6px 12px;border-radius:8px;border:none;background:#4B5563;color:#fff;cursor:pointer;font-weight:600;">끄기</button>
         </div>
       </div>
-      <video id="redf-video" autoplay playsinline muted style="width:100%;max-height:280px;object-fit:cover;border-radius:10px;background:#000;"></video>
-      <canvas id="redf-canvas" style="display:none;"></canvas>
+      <video id="ocr-video" autoplay playsinline muted style="width:100%;max-height:270px;object-fit:cover;border-radius:10px;background:#000;"></video>
+      <canvas id="ocr-canvas" style="display:none;"></canvas>
+      <div id="ocr-preview" style="margin-top:8px;font-size:0.78rem;color:#D1D5DB;white-space:pre-line;max-height:70px;overflow:auto;"></div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <script>
       (function() {
-        const video = document.getElementById("redf-video");
-        const canvas = document.getElementById("redf-canvas");
-        const statusEl = document.getElementById("cam-status");
-        const startBtn = document.getElementById("btn-start-cam");
-        const stopBtn = document.getElementById("btn-stop-cam");
+        const video = document.getElementById("ocr-video");
+        const canvas = document.getElementById("ocr-canvas");
+        const statusEl = document.getElementById("ocr-status");
+        const previewEl = document.getElementById("ocr-preview");
+        const startBtn = document.getElementById("btn-ocr-start");
+        const stopBtn = document.getElementById("btn-ocr-stop");
 
         let stream = null;
-        let scanTimer = null;
-        let lastDetected = "";
-        let lastDetectedTime = 0;
+        let timer = null;
+        let worker = null;
+        let isRecognizing = false;
+        let lastSignature = "";
+        let lastSavedAt = 0;
 
-        const hasBarcodeDetector = ("BarcodeDetector" in window);
-        let detector = null;
-        if (hasBarcodeDetector) {
-          try {
-            detector = new window.BarcodeDetector({
-              formats: ["qr_code", "code_128", "code_39", "ean_13", "ean_8", "upc_a", "upc_e", "data_matrix"]
-            });
-          } catch (e) {
-            detector = null;
-          }
+        async function ensureWorker() {
+          if (worker) return worker;
+          statusEl.textContent = "한글/영문 택 인식 엔진 로딩 중...";
+          worker = await Tesseract.createWorker("kor+eng");
+          return worker;
         }
 
-        function triggerAutoSave(codeValue) {
-          const trimmed = (codeValue || "").trim();
-          if (!trimmed) return;
-          const now = Date.now();
-          // 동일 코드 중복 연속 인식 방지(1.8초 쿨다운)
-          if (trimmed === lastDetected && (now - lastDetectedTime) < 1800) return;
-          lastDetected = trimmed;
-          lastDetectedTime = now;
+        function looksLikeValidTag(text) {
+          const hasNameOrCode =
+            /품\s*명/.test(text) ||
+            /품\s*번/.test(text) ||
+            /[A-Z]{3,}[A-Z0-9\-]{4,}/.test(text);
+          const hasColorOrSize =
+            /색\s*상/.test(text) || /치\s*수/.test(text);
+          return hasNameOrCode && hasColorOrSize;
+        }
 
-          statusEl.textContent = "택 자동 인식됨: " + trimmed + " (저장 중...)";
+        function submitTagText(rawText) {
+          const now = Date.now();
+          const compact = rawText.replace(/\\s+/g, " ").trim();
+          if (!compact) return;
+          if (compact === lastSignature && (now - lastSavedAt) < 2500) return;
+
+          lastSignature = compact;
+          lastSavedAt = now;
+          statusEl.textContent = "택 인식 완료! 자동 저장 중...";
 
           const parentUrl = new URL(window.parent.location.href);
-          parentUrl.searchParams.set("scan_payload", trimmed);
-          parentUrl.searchParams.set("scan_nonce", String(now));
+          parentUrl.searchParams.set("tag_payload", rawText.trim());
+          parentUrl.searchParams.set("tag_nonce", String(now));
           window.parent.history.replaceState({}, "", parentUrl.toString());
           window.parent.location.assign(parentUrl.toString());
         }
 
-        async function scanLoop() {
-          if (!stream || video.readyState < 2) return;
-          if (detector) {
-            try {
-              const barcodes = await detector.detect(video);
-              if (barcodes && barcodes.length > 0 && barcodes[0].rawValue) {
-                triggerAutoSave(barcodes[0].rawValue);
+        async function recognizeFrame() {
+          if (!stream || isRecognizing || video.readyState < 2) return;
+          isRecognizing = true;
+          try {
+            const w = await ensureWorker();
+            const vw = video.videoWidth;
+            const vh = video.videoHeight;
+            if (!vw || !vh) return;
+
+            const cropW = Math.floor(vw * 0.85);
+            const cropH = Math.floor(vh * 0.75);
+            const sx = Math.floor((vw - cropW) / 2);
+            const sy = Math.floor((vh - cropH) / 2);
+
+            canvas.width = cropW;
+            canvas.height = cropH;
+            const ctx = canvas.getContext("2d");
+            ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, cropW, cropH);
+
+            const ret = await w.recognize(canvas);
+            const text = (ret && ret.data && ret.data.text) ? ret.data.text.trim() : "";
+            if (text) {
+              previewEl.textContent = text;
+              if (looksLikeValidTag(text)) {
+                submitTagText(text);
               }
-            } catch (err) {
-              // 프레임 인식 실패는 무시하고 계속 스캔
             }
+          } catch (e) {
+            // 프레임 인식 중 일시 오류 무시
+          } finally {
+            isRecognizing = false;
           }
         }
 
-        async function startCamera() {
+        async function startCam() {
           try {
             if (stream) return;
             stream = await navigator.mediaDevices.getUserMedia({
@@ -378,20 +502,19 @@ def render_camera_scanner(tx_type: str) -> None:
               audio: false
             });
             video.srcObject = stream;
-            statusEl.textContent = detector
-              ? "카메라 실행 중 — 상품택을 비추면 자동 인식됩니다."
-              : "카메라 실행 중 — 아래 빠른 인식/스캐너 입력도 함께 사용할 수 있습니다.";
-            if (scanTimer) clearInterval(scanTimer);
-            scanTimer = setInterval(scanLoop, 450);
+            await ensureWorker();
+            statusEl.textContent = "카메라 스캔 중 — 택을 화면 중앙에 비춰주세요.";
+            if (timer) clearInterval(timer);
+            timer = setInterval(recognizeFrame, 1200);
           } catch (err) {
-            statusEl.textContent = "카메라 접근이 차단되었거나 장치를 찾을 수 없습니다: " + err.message;
+            statusEl.textContent = "카메라 실행 실패: " + err.message;
           }
         }
 
-        function stopCamera() {
-          if (scanTimer) {
-            clearInterval(scanTimer);
-            scanTimer = null;
+        function stopCam() {
+          if (timer) {
+            clearInterval(timer);
+            timer = null;
           }
           if (stream) {
             stream.getTracks().forEach(t => t.stop());
@@ -401,51 +524,56 @@ def render_camera_scanner(tx_type: str) -> None:
           statusEl.textContent = "카메라가 꺼져 있습니다.";
         }
 
-        startBtn.addEventListener("click", startCamera);
-        stopBtn.addEventListener("click", stopCamera);
+        startBtn.addEventListener("click", startCam);
+        stopBtn.addEventListener("click", stopCam);
 
-        // 페이지 진입 시 카메라 자동 시작 시도
-        startCamera();
+        startCam();
       })();
     </script>
     """
-    html(scanner_html, height=365)
+    html(scanner_html, height=390)
 
-    # 카메라 스캐너 URL 파라미터 자동 처리
-    scan_payload = st.query_params.get("scan_payload", "")
-    scan_nonce = st.query_params.get("scan_nonce", "")
-    if scan_payload and scan_nonce and scan_nonce != st.session_state.last_scanned_code:
-        st.session_state.last_scanned_code = scan_nonce
-        ok, msg = save_scanned_tag(tx_type, scan_payload)
-        # 중복 트리거 방지를 위해 쿼리 파라미터 정리
+    # 자동 인식된 택 텍스트 처리
+    tag_payload = st.query_params.get("tag_payload", "")
+    tag_nonce = st.query_params.get("tag_nonce", "")
+    if tag_payload and tag_nonce and tag_nonce != st.session_state.last_scan_nonce:
+        st.session_state.last_scan_nonce = tag_nonce
+        ok, msg = save_scanned_tag(tx_type, tag_payload)
         try:
-            del st.query_params["scan_payload"]
-            del st.query_params["scan_nonce"]
+            del st.query_params["tag_payload"]
+            del st.query_params["tag_nonce"]
         except Exception:
             pass
         if ok:
+            trigger_ding()
             st.success(msg)
         else:
             st.error(msg)
         st.rerun()
 
-    # 수동/바코드스캐너/테스트용 빠른 택 입력 (예: 품명|규격|색상|수량)
-    with st.expander("택 문자열 빠른 입력 / 테스트 (카메라 대체용)", expanded=False):
-        quick_val = st.text_input(
-            "택 데이터 입력 (예: 베이직반팔|L|화이트|1 또는 TAG-001)",
-            key=f"quick_tag_{tx_type}",
-            placeholder="품명|규격|색상|수량 또는 택코드",
+    # 택 텍스트 붙여넣기 / 테스트용 입력 + 소리 테스트
+    with st.expander("택 텍스트 직접 붙여넣기 / 소리 테스트", expanded=False):
+        if st.button("🔔 '띵~' 소리 테스트", key=f"btn_ding_test_{tx_type}"):
+            trigger_ding()
+            st.rerun()
+
+        sample_txt = st.text_area(
+            "택 내용 입력",
+            height=110,
+            key=f"manual_tag_{tx_type}",
+            placeholder="품 명 : 마이크로엠보우먼짚티셔츠\n품 번 : REWFTSWBF051\n색 상 : 버건디(BG)\n치 수 : 100",
         )
-        if st.button("이 택 값으로 즉시 인식 저장", key=f"btn_quick_{tx_type}"):
-            if quick_val.strip():
-                ok, msg = save_scanned_tag(tx_type, quick_val.strip())
+        if st.button("택 내용 인식 및 저장", key=f"btn_manual_tag_{tx_type}"):
+            if sample_txt.strip():
+                ok, msg = save_scanned_tag(tx_type, sample_txt.strip())
                 if ok:
+                    trigger_ding()
                     st.success(msg)
                     st.rerun()
                 else:
                     st.error(msg)
             else:
-                st.warning("택 데이터를 입력해 주세요.")
+                st.warning("택 내용을 입력해 주세요.")
 
 
 # ---------------------------------------------------------------------------
@@ -453,48 +581,55 @@ def render_camera_scanner(tx_type: str) -> None:
 # ---------------------------------------------------------------------------
 def render_transaction_detail_page(tx_type: str) -> None:
     is_inbound = tx_type == "inbound"
-    title_text = "인수 상세" if is_inbound else "반품 상세"
-    badge_color = "#2563EB" if is_inbound else "#DC2626"
+    title_text = "인수" if is_inbound else "반품"
+    title_color = "#1D4ED8" if is_inbound else "#BE123C"
 
-    top_left, top_right = st.columns([1, 5])
-    with top_left:
+    top_l, top_r = st.columns([1.2, 5])
+    with top_l:
         if st.button("← 뒤로가기", key=f"back_{tx_type}"):
             go_to("home" if is_mobile else "lookup")
-    with top_right:
+    with top_r:
         st.markdown(
-            f"<h2 style='margin:0;color:{badge_color};'>🏷️ RedF — {title_text}</h2>",
+            f"<h2 style='margin:0;color:{title_color};'>🏷️ RedF — {title_text}</h2>",
             unsafe_allow_html=True,
         )
 
     st.divider()
 
-    # 상단: 카메라 자동 인식 영역
+    # 상단: 카메라 자동 인식
     render_camera_scanner(tx_type)
 
     st.divider()
 
-    # 하단: 인식된 제품 리스트 (품명, 규격, 색상, 수량 + 업/다운/삭제)
+    # 하단: 품명, 품번, 색상, 치수, 수량 리스트 + 업/다운/삭제
     st.markdown(f"#### 📋 {title_text} 제품 리스트")
     rows = fetch_records(tx_type=tx_type)
 
+    # 리스트가 렌더링되는 시점에 '띵~' 알림음 재생
+    render_ding_if_needed()
+
     if not rows:
-        st.info(f"아직 인식된 {title_text} 제품이 없습니다. 상단 카메라에 상품택을 비춰주세요.")
+        st.info(f"인식된 {title_text} 제품이 없습니다. 상단 카메라에 택을 비춰주세요.")
         return
 
     for row in rows:
         rec_id = row["id"]
-        item_name = row.get("item_name", "-")
-        spec = row.get("spec", "-")
-        color = row.get("color", "-")
+        item_name = row.get("item_name") or "-"
+        item_code = row.get("item_code") or "-"
+        color = row.get("color") or "-"
+        size_val = row.get("size_val") or row.get("spec") or "-"
         qty = int(row.get("qty") or 0)
 
         st.markdown("<div class='item-card'>", unsafe_allow_html=True)
-        c_info, c_up, c_down, c_del = st.columns([5, 1, 1, 1.4])
+        c_info, c_up, c_down, c_del = st.columns([5.2, 1, 1, 1.4])
 
         with c_info:
             st.markdown(f"**품명:** {item_name}")
             st.markdown(
-                f"규격: `{spec}` &nbsp;|&nbsp; 색상: `{color}` &nbsp;|&nbsp; **수량: {qty}**"
+                f"**품번:** `{item_code}` &nbsp;|&nbsp; "
+                f"**색상:** `{color}` &nbsp;|&nbsp; "
+                f"**치수:** `{size_val}` &nbsp;|&nbsp; "
+                f"**수량: {qty}**"
             )
 
         with c_up:
@@ -512,19 +647,18 @@ def render_transaction_detail_page(tx_type: str) -> None:
                 st.session_state.pending_delete_id = rec_id
                 st.rerun()
 
-        # 삭제 확인 팝업/프롬프트
         if st.session_state.pending_delete_id == rec_id:
             st.warning(
-                f"**'{item_name}' ({spec} / {color})** 항목을 정말 삭제하시겠습니까?"
+                f"**'{item_name}' (품번: {item_code} / 색상: {color} / 치수: {size_val})** 항목을 정말 삭제하시겠습니까?"
             )
-            conf_col1, conf_col2, _ = st.columns([1.2, 1.2, 4])
-            with conf_col1:
+            conf1, conf2, _ = st.columns([1.2, 1.2, 4])
+            with conf1:
                 if st.button("예, 삭제합니다", key=f"del_yes_{tx_type}_{rec_id}", type="primary"):
                     delete_record(rec_id)
                     st.session_state.pending_delete_id = None
                     st.success("삭제되었습니다.")
                     st.rerun()
-            with conf_col2:
+            with conf2:
                 if st.button("아니오", key=f"del_no_{tx_type}_{rec_id}"):
                     st.session_state.pending_delete_id = None
                     st.rerun()
@@ -538,7 +672,7 @@ def render_transaction_detail_page(tx_type: str) -> None:
 def render_mobile_home_page() -> None:
     st.markdown("<h1 style='text-align:center;margin-bottom:0.25rem;'>RedF</h1>", unsafe_allow_html=True)
     st.markdown(
-        "<p style='text-align:center;color:#4B5563;margin-bottom:2rem;'>원하시는 작업을 선택해 주세요.</p>",
+        "<p style='text-align:center;color:#4B5563;margin-bottom:2rem;'>원하시는 메뉴를 선택해 주세요.</p>",
         unsafe_allow_html=True,
     )
 
@@ -563,23 +697,23 @@ def render_mobile_home_page() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. 조회 페이지 (PC 기본 진입 화면 / 모바일에서도 선택 가능)
+# 8. 조회 페이지 (PC 기본 화면)
 # ---------------------------------------------------------------------------
 def render_lookup_page() -> None:
     header_l, header_r = st.columns([4, 2])
     with header_l:
         st.markdown("<h2 style='margin:0;color:#111827;'>🔎 RedF 조회</h2>", unsafe_allow_html=True)
-        st.caption("인수 및 반품 내역을 조회하고 수량을 관리할 수 있습니다.")
+        st.caption("품명, 품번, 색상, 치수별 인수·반품 내역을 조회합니다.")
     with header_r:
         if is_mobile:
             if st.button("처음 메뉴로", key="lookup_to_home", use_container_width=True):
                 go_to("home")
         else:
-            nav_c1, nav_c2 = st.columns(2)
-            with nav_c1:
+            nav1, nav2 = st.columns(2)
+            with nav1:
                 if st.button("인수 이동", key="pc_to_inbound", use_container_width=True):
                     go_to("inbound")
-            with nav_c2:
+            with nav2:
                 if st.button("반품 이동", key="pc_to_return", use_container_width=True):
                     go_to("return")
 
@@ -601,37 +735,42 @@ def render_lookup_page() -> None:
 
     st.write("")
 
-    f1, f2, f3 = st.columns([2, 2, 4])
+    f1, f2, f3, f4 = st.columns([1.6, 1.8, 1.8, 3.8])
     with f1:
-        type_filter = st.selectbox(
-            "구분",
-            options=["전체", "인수", "반품"],
-            index=0,
-        )
+        type_filter = st.selectbox("구분", ["전체", "인수", "반품"], index=0)
     with f2:
-        color_options = ["전체"] + sorted(
+        color_opts = ["전체"] + sorted(
             {str(r.get("color") or "미지정") for r in all_rows}
         )
-        color_filter = st.selectbox("색상", options=color_options, index=0)
+        color_filter = st.selectbox("색상", color_opts, index=0)
     with f3:
-        search_text = st.text_input("검색 (품명 / 규격 / 택코드)", placeholder="검색어를 입력하세요")
+        size_opts = ["전체"] + sorted(
+            {str(r.get("size_val") or r.get("spec") or "미지정") for r in all_rows}
+        )
+        size_filter = st.selectbox("치수", size_opts, index=0)
+    with f4:
+        search_text = st.text_input("검색 (품명 / 품번 / 색상 / 치수)", placeholder="검색어 입력")
 
     filtered = []
     for r in all_rows:
         r_type_kr = "인수" if r.get("tx_type") == "inbound" else "반품"
+        r_color = str(r.get("color") or "미지정")
+        r_size = str(r.get("size_val") or r.get("spec") or "미지정")
+
         if type_filter != "전체" and r_type_kr != type_filter:
             continue
-        r_color = str(r.get("color") or "미지정")
         if color_filter != "전체" and r_color != color_filter:
+            continue
+        if size_filter != "전체" and r_size != size_filter:
             continue
         if search_text.strip():
             q = search_text.strip().lower()
             haystack = " ".join(
                 [
                     str(r.get("item_name") or ""),
-                    str(r.get("spec") or ""),
-                    str(r.get("color") or ""),
-                    str(r.get("tag_code") or ""),
+                    str(r.get("item_code") or ""),
+                    r_color,
+                    r_size,
                 ]
             ).lower()
             if q not in haystack:
@@ -641,30 +780,34 @@ def render_lookup_page() -> None:
     st.markdown(f"#### 조회 결과 ({len(filtered)}건)")
 
     if not filtered:
-        st.info("조건에 맞는 조회 데이터가 없습니다.")
+        st.info("조건에 맞는 데이터가 없습니다.")
         return
 
-    display_table = [
+    table_rows = [
         {
             "구분": "인수" if r.get("tx_type") == "inbound" else "반품",
-            "품명": r.get("item_name", "-"),
-            "규격": r.get("spec", "-"),
-            "색상": r.get("color", "-"),
+            "품명": r.get("item_name") or "-",
+            "품번": r.get("item_code") or "-",
+            "색상": r.get("color") or "-",
+            "치수": r.get("size_val") or r.get("spec") or "-",
             "수량": int(r.get("qty") or 0),
-            "택코드": r.get("tag_code", "-"),
         }
         for r in filtered
     ]
-    st.dataframe(display_table, use_container_width=True, hide_index=True)
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
     with st.expander("항목별 수량 조절 및 삭제", expanded=False):
         for r in filtered:
             rec_id = r["id"]
             r_type_kr = "인수" if r.get("tx_type") == "inbound" else "반품"
-            c1, c2, c3, c4 = st.columns([5, 1, 1, 1.4])
+            c1, c2, c3, c4 = st.columns([5.2, 1, 1, 1.4])
             with c1:
                 st.write(
-                    f"**[{r_type_kr}] {r.get('item_name')}** — 규격: `{r.get('spec')}` / 색상: `{r.get('color')}` / 수량: **{r.get('qty')}**"
+                    f"**[{r_type_kr}] {r.get('item_name')}** — "
+                    f"품번: `{r.get('item_code') or '-'}` / "
+                    f"색상: `{r.get('color') or '-'}` / "
+                    f"치수: `{r.get('size_val') or r.get('spec') or '-'}` / "
+                    f"수량: **{r.get('qty')}**"
                 )
             with c2:
                 if st.button("▲", key=f"lk_up_{rec_id}"):
