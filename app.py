@@ -1,8 +1,10 @@
+import base64
 import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import requests
 import streamlit as st
 from streamlit.components.v1 import html
 from supabase import Client, create_client
@@ -23,6 +25,13 @@ def init_supabase() -> Client:
     url = st.secrets["supabase"]["url"]
     key = st.secrets["supabase"]["key"]
     return create_client(url, key)
+
+
+def get_gemini_api_key() -> str:
+    try:
+        return str(st.secrets["gemini"]["api_key"] or "").strip()
+    except Exception:
+        return ""
 
 
 supabase = init_supabase()
@@ -160,12 +169,12 @@ def apply_theme(page_name: str) -> None:
                 background-color: {bg_color} !important;
             }}
             .block-container {{
-                padding-top: 0.9rem;
+                padding-top: 0.85rem;
                 padding-bottom: 2rem;
             }}
             hr {{
-                margin-top: 0.6rem !important;
-                margin-bottom: 0.6rem !important;
+                margin-top: 0.55rem !important;
+                margin-bottom: 0.55rem !important;
             }}
             .redf-btn-inbound button {{
                 background-color: #2563EB !important;
@@ -220,35 +229,86 @@ apply_theme(st.session_state.page)
 
 
 # ---------------------------------------------------------------------------
-# 4. 택 텍스트 파싱 (품명, 품번, 색상, 치수) 및 Supabase CRUD
+# 4. 택 이미지 / 텍스트 분석 (품명, 품번, 색상, 치수) 및 Supabase CRUD
 # ---------------------------------------------------------------------------
-def _clean_label_value(val: str) -> str:
-    return re.sub(r"\s+", " ", val).strip(" :·.-")
+def _clean_val(val: Any, fallback: str) -> str:
+    s = re.sub(r"\s+", " ", str(val or "")).strip(" :·.-")
+    return s if s else fallback
+
+
+def analyze_tag_image_with_gemini(jpeg_b64: str, api_key: str) -> dict[str, Any]:
+    """임시 캡처 이미지(base64 JPEG)를 Gemini로 분석해 품명, 품번, 색상, 치수를 추출합니다."""
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-flash:generateContent?key={api_key}"
+    )
+    prompt = (
+        "이 의류 상품택 이미지에서 '품명', '품번', '색상', '치수'를 정확히 읽어서 "
+        "JSON 객체로만 답하세요. 다른 설명이나 마크다운 코드블록은 쓰지 마세요.\n"
+        "키 이름: item_name, item_code, color, size_val\n"
+        "치수에 '100 (90~110)'처럼 표기된 경우 대표 치수(예: '100')를 넣으세요. "
+        "읽을 수 없는 항목은 빈 문자열 ''로 두세요."
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": jpeg_b64,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    resp = requests.post(endpoint, json=payload, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    text_out = (
+        data.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [{}])[0]
+        .get("text", "")
+    ).strip()
+
+    # 혹시 감싸진 코드블록 제거
+    text_out = re.sub(r"^```(?:json)?\s*|\s*```$", "", text_out, flags=re.IGNORECASE).strip()
+    parsed = json.loads(text_out)
+
+    item_name = _clean_val(parsed.get("item_name"), "")
+    item_code = _clean_val(parsed.get("item_code"), "")
+    color = _clean_val(parsed.get("color"), "미지정")
+    size_val = _clean_val(parsed.get("size_val"), "미지정")
+
+    if not item_name and not item_code:
+        raise ValueError("택에서 품명이나 품번을 읽지 못했습니다.")
+
+    final_name = item_name or item_code
+    final_code = item_code or "미기재"
+
+    return {
+        "item_name": final_name,
+        "item_code": final_code,
+        "color": color,
+        "size_val": size_val,
+        "qty": 1,
+        "tag_code": final_code if final_code != "미기재" else final_name[:50],
+    }
 
 
 def parse_redf_tag_text(raw_text: str) -> dict[str, Any]:
     cleaned = raw_text.strip()
     if not cleaned:
         raise ValueError("인식된 택 데이터가 비어 있습니다.")
-
-    if cleaned.startswith("{") and cleaned.endswith("}"):
-        data = json.loads(cleaned)
-        return {
-            "item_name": _clean_label_value(
-                str(data.get("item_name") or data.get("품명") or "미확인 품명")
-            ),
-            "item_code": _clean_label_value(
-                str(data.get("item_code") or data.get("품번") or "미확인 품번")
-            ),
-            "color": _clean_label_value(
-                str(data.get("color") or data.get("색상") or "미지정")
-            ),
-            "size_val": _clean_label_value(
-                str(data.get("size_val") or data.get("size") or data.get("치수") or "미지정")
-            ),
-            "qty": max(1, int(data.get("qty") or data.get("수량") or 1)),
-            "tag_code": str(data.get("tag_code") or data.get("item_code") or cleaned[:60]),
-        }
 
     item_name = ""
     item_code = ""
@@ -257,49 +317,33 @@ def parse_redf_tag_text(raw_text: str) -> dict[str, Any]:
 
     name_match = re.search(r"품\s*명\s*[:：\-]?\s*([^\n]+)", cleaned)
     if name_match:
-        item_name = _clean_label_value(name_match.group(1))
+        item_name = _clean_val(name_match.group(1), "")
 
     code_match = re.search(r"품\s*번\s*[:：\-]?\s*([A-Za-z0-9\-_]+)", cleaned)
     if code_match:
-        item_code = _clean_label_value(code_match.group(1))
+        item_code = _clean_val(code_match.group(1), "")
 
     color_match = re.search(r"색\s*상\s*[:：\-]?\s*([^\n]+)", cleaned)
     if color_match:
-        color = _clean_label_value(color_match.group(1))
+        color = _clean_val(color_match.group(1), "")
 
     size_match = re.search(
         r"치\s*수\s*[:：\-]?\s*([0-9]{2,3}(?:\s*[A-Za-z가-힣]+)?)", cleaned
     )
     if size_match:
-        size_val = _clean_label_value(size_match.group(1))
-
-    if not (item_name and item_code):
-        for sep in ["|", "/"]:
-            if sep in cleaned:
-                parts = [_clean_label_value(p) for p in cleaned.split(sep)]
-                if len(parts) >= 1 and not item_name:
-                    item_name = parts[0]
-                if len(parts) >= 2 and not item_code:
-                    item_code = parts[1]
-                if len(parts) >= 3 and not color:
-                    color = parts[2]
-                if len(parts) >= 4 and not size_val:
-                    size_val = parts[3]
-                break
+        size_val = _clean_val(size_match.group(1), "")
 
     if not item_name and not item_code:
         raise ValueError("택에서 '품명' 또는 '품번'을 찾지 못했습니다.")
 
     final_name = item_name or item_code
     final_code = item_code or "미기재"
-    final_color = color or "미지정"
-    final_size = size_val or "미지정"
 
     return {
         "item_name": final_name,
         "item_code": final_code,
-        "color": final_color,
-        "size_val": final_size,
+        "color": color or "미지정",
+        "size_val": size_val or "미지정",
         "qty": 1,
         "tag_code": final_code if final_code != "미기재" else final_name[:50],
     }
@@ -313,12 +357,7 @@ def fetch_records(tx_type: Optional[str] = None) -> list[dict[str, Any]]:
     return res.data or []
 
 
-def save_scanned_tag(tx_type: str, raw_payload: str) -> tuple[bool, str]:
-    try:
-        parsed = parse_redf_tag_text(raw_payload)
-    except Exception as exc:
-        return False, f"택 인식 해석 실패: {exc}"
-
+def save_parsed_item(tx_type: str, parsed: dict[str, Any]) -> tuple[bool, str]:
     try:
         existing = (
             supabase.table("redf_transactions")
@@ -389,19 +428,20 @@ def delete_record(record_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. 컴팩트 터치-캡처 카메라 (화면을 터치하면 임시 촬영 -> OCR -> 저장 -> 임시사진 삭제)
+# 5. 적정 크기 카메라 (터치 시 임시 촬영 -> 분석 -> 저장 -> 임시사진 즉시 파기)
 # ---------------------------------------------------------------------------
 def render_camera_scanner(tx_type: str) -> None:
+    gemini_key = get_gemini_api_key()
+
     scanner_html = """
-    <div style="position:relative;width:100%;height:175px;background:#000;border-radius:12px;overflow:hidden;cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent;" id="tap-zone">
+    <div style="position:relative;width:100%;height:235px;background:#000;border-radius:12px;overflow:hidden;cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent;" id="tap-zone">
       <video id="cam-video" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;display:block;"></video>
       <canvas id="temp-canvas" style="display:none;"></canvas>
-      <div id="cam-hint" style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.62);color:#fff;padding:3px 10px;border-radius:999px;font-size:0.75rem;white-space:nowrap;">
-        화면을 터치하면 인식·저장됩니다
+      <div id="cam-hint" style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.65);color:#fff;padding:4px 12px;border-radius:999px;font-size:0.78rem;white-space:nowrap;">
+        택을 맞추고 화면을 터치하세요
       </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <script>
       (function() {
         const tapZone = document.getElementById("tap-zone");
@@ -410,42 +450,38 @@ def render_camera_scanner(tx_type: str) -> None:
         const hint = document.getElementById("cam-hint");
 
         let stream = null;
-        let worker = null;
         let busy = false;
-
-        async function getWorker() {
-          if (worker) return worker;
-          worker = await Tesseract.createWorker("kor+eng");
-          return worker;
-        }
 
         async function startCam() {
           try {
             if (stream) return;
             stream = await navigator.mediaDevices.getUserMedia({
-              video: { facingMode: { ideal: "environment" } },
+              video: {
+                facingMode: { ideal: "environment" },
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+              },
               audio: false
             });
             video.srcObject = stream;
-            getWorker().catch(() => {});
           } catch (err) {
             hint.textContent = "카메라 권한을 허용해 주세요";
           }
         }
 
-        function disposeTempPhoto() {
+        function destroyTempPhoto() {
           try {
             const ctx = canvas.getContext("2d");
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            canvas.width = 0;
-            canvas.height = 0;
+            canvas.width = 1;
+            canvas.height = 1;
           } catch (e) {}
         }
 
-        async function captureAndAnalyze() {
+        function captureAndSend() {
           if (busy || !stream || video.readyState < 2) return;
           busy = true;
-          hint.textContent = "인식 중...";
+          hint.textContent = "분석 중...";
 
           try {
             const vw = video.videoWidth;
@@ -455,60 +491,78 @@ def render_camera_scanner(tx_type: str) -> None:
               return;
             }
 
-            // 임시 캡처
-            canvas.width = vw;
-            canvas.height = vh;
+            // 용량 최적화 후 임시 캡처
+            const maxW = 1024;
+            const scale = vw > maxW ? (maxW / vw) : 1;
+            const tw = Math.floor(vw * scale);
+            const th = Math.floor(vh * scale);
+
+            canvas.width = tw;
+            canvas.height = th;
             const ctx = canvas.getContext("2d");
-            ctx.drawImage(video, 0, 0, vw, vh);
+            ctx.drawImage(video, 0, 0, tw, th);
 
-            const w = await getWorker();
-            const ret = await w.recognize(canvas);
-            const text = (ret && ret.data && ret.data.text) ? ret.data.text.trim() : "";
+            const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+            const b64 = dataUrl.split(",")[1] || "";
 
-            // 임시 사진 즉시 삭제
-            disposeTempPhoto();
+            // 캡처 직후 임시 캔버스 사진 삭제
+            destroyTempPhoto();
 
-            if (!text) {
-              hint.textContent = "글자를 못 읽었어요. 다시 터치해 주세요";
+            if (!b64) {
+              hint.textContent = "다시 터치해 주세요";
               busy = false;
               return;
             }
 
             const nonce = String(Date.now());
             const parentUrl = new URL(window.parent.location.href);
-            parentUrl.searchParams.set("tag_payload", text);
-            parentUrl.searchParams.set("tag_nonce", nonce);
+            parentUrl.searchParams.set("img_b64", b64);
+            parentUrl.searchParams.set("scan_nonce", nonce);
             window.parent.history.replaceState({}, "", parentUrl.toString());
             window.parent.location.assign(parentUrl.toString());
           } catch (err) {
-            disposeTempPhoto();
+            destroyTempPhoto();
             hint.textContent = "다시 터치해 주세요";
             busy = false;
           }
         }
 
-        tapZone.addEventListener("click", captureAndAnalyze);
+        tapZone.addEventListener("click", captureAndSend);
         startCam();
       })();
     </script>
     """
-    html(scanner_html, height=185)
+    html(scanner_html, height=245)
 
-    tag_payload = st.query_params.get("tag_payload", "")
-    tag_nonce = st.query_params.get("tag_nonce", "")
-    if tag_payload and tag_nonce and tag_nonce != st.session_state.last_scan_nonce:
-        st.session_state.last_scan_nonce = tag_nonce
-        ok, msg = save_scanned_tag(tx_type, tag_payload)
+    img_b64 = st.query_params.get("img_b64", "")
+    scan_nonce = st.query_params.get("scan_nonce", "")
+
+    if img_b64 and scan_nonce and scan_nonce != st.session_state.last_scan_nonce:
+        st.session_state.last_scan_nonce = scan_nonce
+
+        # 쿼리 파라미터 즉시 제거
         try:
-            del st.query_params["tag_payload"]
-            del st.query_params["tag_nonce"]
+            del st.query_params["img_b64"]
+            del st.query_params["scan_nonce"]
         except Exception:
             pass
-        if ok:
-            trigger_ding()
-            st.success(msg)
+
+        if not gemini_key:
+            st.error("`[gemini] api_key`가 설정되어 있지 않습니다. Secrets에 Gemini API 키를 넣어주세요.")
         else:
-            st.error(msg)
+            try:
+                parsed = analyze_tag_image_with_gemini(img_b64, gemini_key)
+                ok, msg = save_parsed_item(tx_type, parsed)
+                if ok:
+                    trigger_ding()
+                    st.success(msg)
+                else:
+                    st.error(msg)
+            except Exception as exc:
+                st.error(f"택 인식 실패: {exc}")
+
+        # 임시 base64 문자열 메모리 해제 유도
+        del img_b64
         st.rerun()
 
 
