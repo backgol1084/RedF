@@ -83,7 +83,6 @@ def trigger_ding() -> None:
 
 
 def render_ding_if_needed() -> None:
-    """저장 및 리스트 반영 직후 '띵~' 사운드를 1회 재생합니다."""
     if not st.session_state.get("play_ding"):
         return
 
@@ -100,7 +99,6 @@ def render_ding_if_needed() -> None:
           const ctx = new AudioCtx();
           const now = ctx.currentTime;
 
-          // '띵~' 느낌의 맑은 벨 톤 (A5 -> D6)
           const osc1 = ctx.createOscillator();
           const osc2 = ctx.createOscillator();
           const gain = ctx.createGain();
@@ -130,9 +128,7 @@ def render_ding_if_needed() -> None:
           osc1.onended = () => {{
             ctx.close().catch(() => {{}});
           }};
-        }} catch (e) {{
-          // 오디오 재생 제한 환경 무시
-        }}
+        }} catch (e) {{}}
       }})();
     </script>
     """
@@ -164,8 +160,12 @@ def apply_theme(page_name: str) -> None:
                 background-color: {bg_color} !important;
             }}
             .block-container {{
-                padding-top: 1.4rem;
-                padding-bottom: 3rem;
+                padding-top: 0.9rem;
+                padding-bottom: 2rem;
+            }}
+            hr {{
+                margin-top: 0.6rem !important;
+                margin-bottom: 0.6rem !important;
             }}
             .redf-btn-inbound button {{
                 background-color: #2563EB !important;
@@ -204,11 +204,11 @@ def apply_theme(page_name: str) -> None:
                 background-color: #EAB308 !important;
             }}
             .item-card {{
-                background-color: rgba(255, 255, 255, 0.92);
+                background-color: rgba(255, 255, 255, 0.94);
                 border: 1px solid #E5E7EB;
-                border-radius: 12px;
-                padding: 0.85rem 1rem;
-                margin-bottom: 0.65rem;
+                border-radius: 10px;
+                padding: 0.65rem 0.85rem;
+                margin-bottom: 0.5rem;
             }}
         </style>
         """,
@@ -343,7 +343,7 @@ def save_scanned_tag(tx_type: str, raw_payload: str) -> tuple[bool, str]:
             ).eq("id", row["id"]).execute()
             return (
                 True,
-                f"인식·수량추가(+1): {parsed['item_name']} | {parsed['item_code']} | {parsed['color']} | {parsed['size_val']} → {new_qty}개",
+                f"수량 +1: {parsed['item_name']} ({parsed['item_code']} / {parsed['color']} / {parsed['size_val']}) → {new_qty}개",
             )
 
         supabase.table("redf_transactions").insert(
@@ -360,7 +360,7 @@ def save_scanned_tag(tx_type: str, raw_payload: str) -> tuple[bool, str]:
         ).execute()
         return (
             True,
-            f"자동 저장 완료: {parsed['item_name']} | {parsed['item_code']} | {parsed['color']} | {parsed['size_val']} (1개)",
+            f"저장 완료: {parsed['item_name']} ({parsed['item_code']} / {parsed['color']} / {parsed['size_val']})",
         )
     except Exception as exc:
         return False, f"DB 저장 오류: {exc}"
@@ -389,109 +389,34 @@ def delete_record(record_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. 상단 카메라 실시간 택 OCR 자동 인식 (셔터 없이 인식 시 자동 저장)
+# 5. 컴팩트 터치-캡처 카메라 (화면을 터치하면 임시 촬영 -> OCR -> 저장 -> 임시사진 삭제)
 # ---------------------------------------------------------------------------
 def render_camera_scanner(tx_type: str) -> None:
-    st.markdown("#### 📷 상품택 자동 인식 카메라")
-    st.caption("카메라에 택을 비추면 촬영 버튼을 누르지 않아도 품명·품번·색상·치수를 읽어 자동 저장합니다.")
-
     scanner_html = """
-    <div style="background:#111827;color:#F9FAFB;padding:12px;border-radius:12px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap;">
-        <span id="ocr-status" style="font-size:0.88rem;">OCR 엔진 준비 중...</span>
-        <div>
-          <button id="btn-ocr-start" type="button" style="padding:6px 12px;border-radius:8px;border:none;background:#2563EB;color:#fff;cursor:pointer;font-weight:600;">카메라 켜기</button>
-          <button id="btn-ocr-stop" type="button" style="padding:6px 12px;border-radius:8px;border:none;background:#4B5563;color:#fff;cursor:pointer;font-weight:600;">끄기</button>
-        </div>
+    <div style="position:relative;width:100%;height:175px;background:#000;border-radius:12px;overflow:hidden;cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent;" id="tap-zone">
+      <video id="cam-video" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;display:block;"></video>
+      <canvas id="temp-canvas" style="display:none;"></canvas>
+      <div id="cam-hint" style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.62);color:#fff;padding:3px 10px;border-radius:999px;font-size:0.75rem;white-space:nowrap;">
+        화면을 터치하면 인식·저장됩니다
       </div>
-      <video id="ocr-video" autoplay playsinline muted style="width:100%;max-height:270px;object-fit:cover;border-radius:10px;background:#000;"></video>
-      <canvas id="ocr-canvas" style="display:none;"></canvas>
-      <div id="ocr-preview" style="margin-top:8px;font-size:0.78rem;color:#D1D5DB;white-space:pre-line;max-height:70px;overflow:auto;"></div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <script>
       (function() {
-        const video = document.getElementById("ocr-video");
-        const canvas = document.getElementById("ocr-canvas");
-        const statusEl = document.getElementById("ocr-status");
-        const previewEl = document.getElementById("ocr-preview");
-        const startBtn = document.getElementById("btn-ocr-start");
-        const stopBtn = document.getElementById("btn-ocr-stop");
+        const tapZone = document.getElementById("tap-zone");
+        const video = document.getElementById("cam-video");
+        const canvas = document.getElementById("temp-canvas");
+        const hint = document.getElementById("cam-hint");
 
         let stream = null;
-        let timer = null;
         let worker = null;
-        let isRecognizing = false;
-        let lastSignature = "";
-        let lastSavedAt = 0;
+        let busy = false;
 
-        async function ensureWorker() {
+        async function getWorker() {
           if (worker) return worker;
-          statusEl.textContent = "한글/영문 택 인식 엔진 로딩 중...";
           worker = await Tesseract.createWorker("kor+eng");
           return worker;
-        }
-
-        function looksLikeValidTag(text) {
-          const hasNameOrCode =
-            /품\s*명/.test(text) ||
-            /품\s*번/.test(text) ||
-            /[A-Z]{3,}[A-Z0-9\-]{4,}/.test(text);
-          const hasColorOrSize =
-            /색\s*상/.test(text) || /치\s*수/.test(text);
-          return hasNameOrCode && hasColorOrSize;
-        }
-
-        function submitTagText(rawText) {
-          const now = Date.now();
-          const compact = rawText.replace(/\\s+/g, " ").trim();
-          if (!compact) return;
-          if (compact === lastSignature && (now - lastSavedAt) < 2500) return;
-
-          lastSignature = compact;
-          lastSavedAt = now;
-          statusEl.textContent = "택 인식 완료! 자동 저장 중...";
-
-          const parentUrl = new URL(window.parent.location.href);
-          parentUrl.searchParams.set("tag_payload", rawText.trim());
-          parentUrl.searchParams.set("tag_nonce", String(now));
-          window.parent.history.replaceState({}, "", parentUrl.toString());
-          window.parent.location.assign(parentUrl.toString());
-        }
-
-        async function recognizeFrame() {
-          if (!stream || isRecognizing || video.readyState < 2) return;
-          isRecognizing = true;
-          try {
-            const w = await ensureWorker();
-            const vw = video.videoWidth;
-            const vh = video.videoHeight;
-            if (!vw || !vh) return;
-
-            const cropW = Math.floor(vw * 0.85);
-            const cropH = Math.floor(vh * 0.75);
-            const sx = Math.floor((vw - cropW) / 2);
-            const sy = Math.floor((vh - cropH) / 2);
-
-            canvas.width = cropW;
-            canvas.height = cropH;
-            const ctx = canvas.getContext("2d");
-            ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, cropW, cropH);
-
-            const ret = await w.recognize(canvas);
-            const text = (ret && ret.data && ret.data.text) ? ret.data.text.trim() : "";
-            if (text) {
-              previewEl.textContent = text;
-              if (looksLikeValidTag(text)) {
-                submitTagText(text);
-              }
-            }
-          } catch (e) {
-            // 프레임 인식 중 일시 오류 무시
-          } finally {
-            isRecognizing = false;
-          }
         }
 
         async function startCam() {
@@ -502,38 +427,73 @@ def render_camera_scanner(tx_type: str) -> None:
               audio: false
             });
             video.srcObject = stream;
-            await ensureWorker();
-            statusEl.textContent = "카메라 스캔 중 — 택을 화면 중앙에 비춰주세요.";
-            if (timer) clearInterval(timer);
-            timer = setInterval(recognizeFrame, 1200);
+            getWorker().catch(() => {});
           } catch (err) {
-            statusEl.textContent = "카메라 실행 실패: " + err.message;
+            hint.textContent = "카메라 권한을 허용해 주세요";
           }
         }
 
-        function stopCam() {
-          if (timer) {
-            clearInterval(timer);
-            timer = null;
-          }
-          if (stream) {
-            stream.getTracks().forEach(t => t.stop());
-            stream = null;
-          }
-          video.srcObject = null;
-          statusEl.textContent = "카메라가 꺼져 있습니다.";
+        function disposeTempPhoto() {
+          try {
+            const ctx = canvas.getContext("2d");
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            canvas.width = 0;
+            canvas.height = 0;
+          } catch (e) {}
         }
 
-        startBtn.addEventListener("click", startCam);
-        stopBtn.addEventListener("click", stopCam);
+        async function captureAndAnalyze() {
+          if (busy || !stream || video.readyState < 2) return;
+          busy = true;
+          hint.textContent = "인식 중...";
 
+          try {
+            const vw = video.videoWidth;
+            const vh = video.videoHeight;
+            if (!vw || !vh) {
+              busy = false;
+              return;
+            }
+
+            // 임시 캡처
+            canvas.width = vw;
+            canvas.height = vh;
+            const ctx = canvas.getContext("2d");
+            ctx.drawImage(video, 0, 0, vw, vh);
+
+            const w = await getWorker();
+            const ret = await w.recognize(canvas);
+            const text = (ret && ret.data && ret.data.text) ? ret.data.text.trim() : "";
+
+            // 임시 사진 즉시 삭제
+            disposeTempPhoto();
+
+            if (!text) {
+              hint.textContent = "글자를 못 읽었어요. 다시 터치해 주세요";
+              busy = false;
+              return;
+            }
+
+            const nonce = String(Date.now());
+            const parentUrl = new URL(window.parent.location.href);
+            parentUrl.searchParams.set("tag_payload", text);
+            parentUrl.searchParams.set("tag_nonce", nonce);
+            window.parent.history.replaceState({}, "", parentUrl.toString());
+            window.parent.location.assign(parentUrl.toString());
+          } catch (err) {
+            disposeTempPhoto();
+            hint.textContent = "다시 터치해 주세요";
+            busy = false;
+          }
+        }
+
+        tapZone.addEventListener("click", captureAndAnalyze);
         startCam();
       })();
     </script>
     """
-    html(scanner_html, height=390)
+    html(scanner_html, height=185)
 
-    # 자동 인식된 택 텍스트 처리
     tag_payload = st.query_params.get("tag_payload", "")
     tag_nonce = st.query_params.get("tag_nonce", "")
     if tag_payload and tag_nonce and tag_nonce != st.session_state.last_scan_nonce:
@@ -551,30 +511,6 @@ def render_camera_scanner(tx_type: str) -> None:
             st.error(msg)
         st.rerun()
 
-    # 택 텍스트 붙여넣기 / 테스트용 입력 + 소리 테스트
-    with st.expander("택 텍스트 직접 붙여넣기 / 소리 테스트", expanded=False):
-        if st.button("🔔 '띵~' 소리 테스트", key=f"btn_ding_test_{tx_type}"):
-            trigger_ding()
-            st.rerun()
-
-        sample_txt = st.text_area(
-            "택 내용 입력",
-            height=110,
-            key=f"manual_tag_{tx_type}",
-            placeholder="품 명 : 마이크로엠보우먼짚티셔츠\n품 번 : REWFTSWBF051\n색 상 : 버건디(BG)\n치 수 : 100",
-        )
-        if st.button("택 내용 인식 및 저장", key=f"btn_manual_tag_{tx_type}"):
-            if sample_txt.strip():
-                ok, msg = save_scanned_tag(tx_type, sample_txt.strip())
-                if ok:
-                    trigger_ding()
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-            else:
-                st.warning("택 내용을 입력해 주세요.")
-
 
 # ---------------------------------------------------------------------------
 # 6. 인수 / 반품 공통 상세 페이지
@@ -584,32 +520,24 @@ def render_transaction_detail_page(tx_type: str) -> None:
     title_text = "인수" if is_inbound else "반품"
     title_color = "#1D4ED8" if is_inbound else "#BE123C"
 
-    top_l, top_r = st.columns([1.2, 5])
+    top_l, top_r = st.columns([1.3, 5])
     with top_l:
-        if st.button("← 뒤로가기", key=f"back_{tx_type}"):
+        if st.button("← 뒤로", key=f"back_{tx_type}"):
             go_to("home" if is_mobile else "lookup")
     with top_r:
         st.markdown(
-            f"<h2 style='margin:0;color:{title_color};'>🏷️ RedF — {title_text}</h2>",
+            f"<h3 style='margin:0;color:{title_color};'>{title_text}</h3>",
             unsafe_allow_html=True,
         )
 
-    st.divider()
-
-    # 상단: 카메라 자동 인식
     render_camera_scanner(tx_type)
-
     st.divider()
 
-    # 하단: 품명, 품번, 색상, 치수, 수량 리스트 + 업/다운/삭제
-    st.markdown(f"#### 📋 {title_text} 제품 리스트")
     rows = fetch_records(tx_type=tx_type)
-
-    # 리스트가 렌더링되는 시점에 '띵~' 알림음 재생
     render_ding_if_needed()
 
     if not rows:
-        st.info(f"인식된 {title_text} 제품이 없습니다. 상단 카메라에 택을 비춰주세요.")
+        st.caption(f"등록된 {title_text} 내역이 없습니다.")
         return
 
     for row in rows:
@@ -624,13 +552,8 @@ def render_transaction_detail_page(tx_type: str) -> None:
         c_info, c_up, c_down, c_del = st.columns([5.2, 1, 1, 1.4])
 
         with c_info:
-            st.markdown(f"**품명:** {item_name}")
-            st.markdown(
-                f"**품번:** `{item_code}` &nbsp;|&nbsp; "
-                f"**색상:** `{color}` &nbsp;|&nbsp; "
-                f"**치수:** `{size_val}` &nbsp;|&nbsp; "
-                f"**수량: {qty}**"
-            )
+            st.markdown(f"**{item_name}**")
+            st.caption(f"품번: {item_code} · 색상: {color} · 치수: {size_val} · **수량: {qty}**")
 
         with c_up:
             if st.button("▲", key=f"up_{tx_type}_{rec_id}", help="수량 증가"):
@@ -648,15 +571,12 @@ def render_transaction_detail_page(tx_type: str) -> None:
                 st.rerun()
 
         if st.session_state.pending_delete_id == rec_id:
-            st.warning(
-                f"**'{item_name}' (품번: {item_code} / 색상: {color} / 치수: {size_val})** 항목을 정말 삭제하시겠습니까?"
-            )
+            st.warning(f"**'{item_name}'** 항목을 정말 삭제하시겠습니까?")
             conf1, conf2, _ = st.columns([1.2, 1.2, 4])
             with conf1:
                 if st.button("예, 삭제합니다", key=f"del_yes_{tx_type}_{rec_id}", type="primary"):
                     delete_record(rec_id)
                     st.session_state.pending_delete_id = None
-                    st.success("삭제되었습니다.")
                     st.rerun()
             with conf2:
                 if st.button("아니오", key=f"del_no_{tx_type}_{rec_id}"):
@@ -670,11 +590,7 @@ def render_transaction_detail_page(tx_type: str) -> None:
 # 7. 모바일 첫 페이지 (인수: 파랑, 반품: 빨강, 조회: 노랑)
 # ---------------------------------------------------------------------------
 def render_mobile_home_page() -> None:
-    st.markdown("<h1 style='text-align:center;margin-bottom:0.25rem;'>RedF</h1>", unsafe_allow_html=True)
-    st.markdown(
-        "<p style='text-align:center;color:#4B5563;margin-bottom:2rem;'>원하시는 메뉴를 선택해 주세요.</p>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("<h1 style='text-align:center;margin-bottom:1.5rem;'>RedF</h1>", unsafe_allow_html=True)
 
     st.markdown("<div class='redf-btn-inbound'>", unsafe_allow_html=True)
     if st.button("인수", key="home_btn_inbound", use_container_width=True):
@@ -702,8 +618,7 @@ def render_mobile_home_page() -> None:
 def render_lookup_page() -> None:
     header_l, header_r = st.columns([4, 2])
     with header_l:
-        st.markdown("<h2 style='margin:0;color:#111827;'>🔎 RedF 조회</h2>", unsafe_allow_html=True)
-        st.caption("품명, 품번, 색상, 치수별 인수·반품 내역을 조회합니다.")
+        st.markdown("<h2 style='margin:0;color:#111827;'>RedF 조회</h2>", unsafe_allow_html=True)
     with header_r:
         if is_mobile:
             if st.button("처음 메뉴로", key="lookup_to_home", use_container_width=True):
